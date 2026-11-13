@@ -367,12 +367,15 @@ Being direct about this, because a `git clone` will not get you a running pipeli
 
 ## Team
 
-Built by Group 10 of the Lighthouse program (6 months):
+Built over six months by Group 10 of the Lighthouse program:
 
-* **Eva Carrasquel** — Tech Lead
-* **Gabriel Henrique Silva** — Analytics Engineering
-* **Leonardo Pinho** — Data Engineering
-* **Eros Gonçalves** — Data Engineering
+**Eva Carrasquel** · **Gabriel Henrique Silva** · **Leonardo Pinho** · **Eros Gonçalves**
+
+There were no fixed roles. Tech lead rotated at every checkpoint of the program, so each of the four
+held it at some point, and everyone worked full-stack across the whole platform — data engineering,
+analytics engineering, AI engineering and machine learning engineering. The five model experiments
+under `forecasting/experiments/` are one visible trace of that: every member of the team owns at
+least one.
 
 [`CLAUDE.md`](CLAUDE.md) holds the working architecture notes the team kept alongside the code.
 
