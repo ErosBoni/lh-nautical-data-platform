@@ -1,0 +1,34 @@
+# The only checks that run without a Databricks workspace: lint, the RAG unit
+# tests (pure Python) and a dbt parse. The ingestion tests need Databricks
+# Connect against real compute, and dbt build needs a SQL Warehouse, so neither
+# runs here.
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Ruff
+        run: uv run ruff check .
+
+      - name: RAG unit tests
+        run: uv run pytest databricks/rag/tests -q
+
+      - name: Build the ingestion wheel
+        run: uv build --wheel

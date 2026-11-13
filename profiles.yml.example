@@ -1,0 +1,39 @@
+# dbt profile for this project. Copy to `~/.dbt/profiles.yml` (or merge the
+# `desafio_lh` block into an existing file) and fill in your own values.
+#
+#     cp profiles.yml.example ~/.dbt/profiles.yml
+#
+# The profile name must stay `desafio_lh`: it is what `dbt/dbt_project.yml`
+# declares, and `forecasting/_shared/db_connection.py` reads the `dev` output of
+# this exact profile (keys `host`, `http_path`, `catalog`, `schema` and the
+# optional `token`) so the forecasting scripts reuse the same credentials
+# instead of duplicating them in the repo.
+
+desafio_lh:
+  target: dev
+  outputs:
+    dev:
+      type: databricks
+      # Workspace host WITHOUT the https:// scheme
+      host: <your-workspace>.cloud.databricks.com
+      # SQL Warehouse connection string: SQL Warehouses > your warehouse >
+      # Connection details > HTTP path
+      http_path: /sql/1.0/warehouses/<your-warehouse-id>
+      catalog: develop
+      # Same prefix used for dev_schema in databricks.local.yml; the
+      # generate_schema_name macro appends _staging / _intermediate / _marts
+      schema: <your_short_name>_analytics
+      threads: 4
+      # OAuth (U2M) is the default and works on Databricks Free Edition, which
+      # does not allow personal access tokens. To use a PAT instead, drop
+      # auth_type and set `token: dapi...` here.
+      auth_type: databricks-oauth
+
+    prod:
+      type: databricks
+      host: <your-workspace>.cloud.databricks.com
+      http_path: /sql/1.0/warehouses/<your-warehouse-id>
+      catalog: lh_nautical
+      schema: prod
+      threads: 8
+      auth_type: databricks-oauth

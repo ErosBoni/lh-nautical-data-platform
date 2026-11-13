@@ -1,0 +1,181 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## Project Configuration
+
+### to-tickets skill
+
+- **Tracker:** Local files — write one Markdown file per ticket under `.scratch/<feature-slug>/issues/<NN>-<slug>.md`, per the skill's local-ticket-template.
+- **Triage label:** N/A for local files (the template's `Status: ready-for-agent` field covers this).
+
+## What this project is
+
+A data pipeline for the "Lighthouse" project (Grupo 10 / TeslaVinci): incremental ingestion from SQL Server into the Bronze layer of Databricks (Unity Catalog), followed by dbt transformations into a star schema, with LGPD governance (dynamic column masking, RBAC), orchestration via Databricks Workflows, a demand-forecasting analysis workstream and a RAG assistant over the resulting warehouse.
+
+**Note:** This is a mock database intended for learning purposes and does not update in production. The source data already contains some future-dated records which the team has decided to filter out via the `filter_valid_orders()` and related macros in `dbt/macros/data_quality_and_dedupe.sql`.
+
+**This repo is a sanitized public export** of the original company Bitbucket repo: the workspace host, workspace user e-mail and the orchestration `job_id`s are `<placeholders>`, and there is no commit history. Do not "fix" those placeholders into real-looking values.
+
+## Repository structure
+
+This repo contains **four independent Databricks Asset Bundles** plus a dbt project. Each bundle has its own `databricks.yml` and is deployed/run separately — there is no single root bundle.
+
+```
+databricks/
+  ingestion/       # Bundle "grupo10": SQL Server -> Bronze ingestion job
+  transformation/  # Bundle "transformation": runs `dbt build` as a Databricks job task
+  orchestration/   # Bundle "orchestration": top-level job that chains ingestion -> transformation
+  rag/             # Bundle "rag": document corpus, vector index and Streamlit chat app (see below)
+dbt/                # dbt project ("desafio_lh"): staging -> intermediate -> marts (star schema)
+forecasting/        # Demand-forecasting analysis (baselines, features, five model experiments), not a deployed bundle (see below)
+```
+
+`databricks/orchestration` does **not** reference the other bundles by include; it wires ingestion and transformation together at the Databricks job level via `job_id`s in `orchestration_job.yml` (`run_job_task`), so those two jobs must already be deployed before the orchestration job can run. The `rag` bundle is not part of that chain — it is run on demand.
+
+Each bundle target (`dev`/`prod`) is configured in its own `databricks.yml`. `dev` is always the default target and resolves to per-user schemas (e.g. `${workspace.current_user.short_name}_analytics`); `prod` points at the `lh_nautical` catalog. Local, uncommitted overrides (per-developer workspace host / `dev_schema`) live in `databricks.local.yml` at the repo root, included by the **ingestion, orchestration and rag** bundles — each developer copies it from `databricks.local.yml.example`; it is not checked in. `transformation` does not include it (host from the CLI profile, schema from `short_name`). The dbt profile shape is in `profiles.yml.example`.
+
+The ingestion Python package is `databricks/ingestion/src/grupo10/`, and `pyproject.toml`'s wheel target points at it directly (there is no top-level `src/`).
+
+## Commands
+
+Install dependencies (uv-managed project, Python >=3.10,<3.13):
+```bash
+uv sync --dev
+```
+
+Run ingestion tests (uses Databricks Connect against a real/serverless workspace — requires `databricks auth login` first, not a local mock):
+```bash
+cd databricks/ingestion && uv run pytest
+```
+
+Run the RAG unit tests (pure Python, the only tests that work offline):
+```bash
+uv run pytest databricks/rag/tests
+```
+
+Lint (ruff, configured at the repo root, line-length 120). It is currently clean — keep it that way. Databricks notebook sources are exempted from `F821`/`E402` via `per-file-ignores` in `pyproject.toml` because `spark`/`dbutils`/cross-cell globals are runtime-injected; don't add blanket `# noqa` instead:
+```bash
+uv run ruff check .
+```
+
+Deploy / run a specific bundle (run from within that bundle's directory, e.g. `databricks/ingestion`):
+```bash
+databricks bundle deploy --target dev   # or prod
+databricks bundle run ingestion         # job name as defined in that bundle's resources/*.yml
+```
+
+dbt (run from `dbt/`, against a configured `desafio_lh` profile — in CI/CD this runs as the `dbt_build` task inside the `transformation` bundle instead):
+```bash
+dbt deps
+dbt build
+dbt docs generate && dbt docs serve
+```
+
+CI is `.github/workflows/lint.yml` and runs only what works without a workspace: `ruff check .`, `pytest databricks/rag/tests` and `uv build --wheel`. Everything else — the ingestion tests, `dbt build`, any `bundle deploy` — has to be run manually against a real workspace before considering a change done.
+
+## Ingestion architecture (`databricks/ingestion`)
+
+The `ingestion` job (`resources/ingestion.job.yml`) runs as notebook tasks against Bronze:
+
+```
+setup -> ingest_tables (for_each per table, concurrency 5) -> ingest_bcb_exchange_rates -> check_bcb_consecutive_failures (only on failure)
+```
+
+- `setup` creates the catalog/schema, control/audit tables, and emits the list of tables (from `tables_config.json`) for the `for_each_task` to fan out over.
+- Per-table ingestion strategy is chosen by primary key shape in `run_incremental_ingestion()` (`src/grupo10/ingest.py`):
+  - **Single key** (e.g. `"id"`) → incremental watermark pagination (`_ingestion_control` table tracks `last_processed_id`), appended in batches of `DEFAULT_LINES_PER_BATCH`.
+  - **Composite key** (e.g. `stock_levels`, `product_suppliers`, `variant_attribute_values`) → full reload + MERGE via `_merge_into_delta()`, keyed on all PK columns.
+  - All writes are idempotent; a batch write failure re-raises so the Databricks task fails and can be selectively rerun.
+- `_ingestion_audit` records status/duration/row-count/error per table run (`src/grupo10/utils/audit.py`).
+- `src/grupo10/utils/alerting.py` tracks a separate daily run-history table keyed by `(task_name, run_date)` and computes consecutive-failure streaks — used by `check_bcb_consecutive_failures.ipynb` to trigger the native on_failure email only after repeated failures, not a single blip.
+- Sensitive columns are masked dynamically via a Unity Catalog UDF (`governance_setup.ipynb`) driven by `governance_config.json`; RBAC grants are applied in `apply_rbca.ipynb`. Credentials come from `dbutils.secrets.get()` in the `sqlserver` scope, never hardcoded.
+
+## dbt architecture (`dbt/`)
+
+Project name `desafio_lh`, profile `desafio_lh`. Three layers under `models/`, each with its own schema suffix set in `dbt_project.yml`:
+
+- **staging** (views, `+schema: staging`) — 1:1 cleanup/typing of Bronze sources (`stg_*.sql`), sources declared in `models/staging/src_bronze.yml`.
+- **intermediate** (views, `+schema: intermediate`) — cross-entity business logic (`int_products_categorized`, `int_sales_enriched`, `int_purchases_enriched`, `int_returns_enriched`, `int_supplier_delivery_delay`).
+- **marts** (tables, `+schema: marts`) — star schema: dimensions (`dim_calendary`, `dim_customers`, `dim_customer_addresses`, `dim_employees`, `dim_locations`, `dim_products`, `dim_suppliers`) and facts (`fct_sales`, `fct_daily_stock_levels`, `fct_purchases`, `fct_returns`), plus a pre-aggregated `marts/aggregates/` subfolder built for BI consumption directly (see below).
+
+Schema resolution is environment-aware via the custom `generate_schema_name` macro (`macros/generate_schema_name.sql`): in `dev`, layer schemas are suffixed onto each developer's own schema (`<user>_analytics_staging`, etc.) for isolation; in `prod`, the layer name is used directly (`staging`, `intermediate`, `marts`).
+
+### Marts reference for BI / DAX work (grain and keys)
+
+Dimensions:
+- `dim_customers` — 1 row per customer (`customer_sk`); carries `person_type` (PF individual / PJ corporate).
+- `dim_customer_addresses` — **SCD2**, 1 row per address version (`customer_address_sk`), `is_current` / `valid_from` / `valid_to` flag the active version; FK `customer_id`.
+- `dim_products`, `dim_locations`, `dim_employees`, `dim_suppliers`, `dim_calendary` (`date_id`, integer `YYYYMMDD`).
+
+Transaction-grain facts:
+- `fct_sales` — 1 row per order item (`sales_sk`). Product FK is `product_variant_sk`. `order_status` includes `paid`/`confirmed`/`cancelled`/`draft`, but only `paid`+`confirmed` count as valid revenue — filter or use the pre-filtered aggregates below instead of summing `fct_sales` raw. `date_id` falls back to `19000101` (no match in `dim_calendary`) when `placed_at` is null — such rows land in Power BI's blank relationship row; expect and don't "fix" that in a DAX measure.
+- `fct_returns` — 1 row per returned item (`return_sk`), bridges to `fct_sales` via `order_item_id`. `product_variant_sk`/`returned_variant_id` point to the **originally sold/returned** product (not the exchange); `exchange_variant_id` is the separate replacement product when `action = 'exchange'`. Unlike `fct_sales`, `date_id` here has invalid/null/future dates filtered out at the model level rather than falling back to `19000101`.
+- `fct_purchases`, `fct_daily_stock_levels` — supplier purchases and daily inventory snapshots, not directly relevant to sales/customer KPIs.
+
+Pre-aggregated marts (`marts/aggregates/`) — prefer these as the DAX/Power BI source over hand-rolling the same logic from the transaction facts:
+- `agg_customer_metrics` — **1 row per customer.** Gross/net LTV, first/last purchase date, `is_churn_risk` (segmented threshold: 180d PJ / 240d PF), dynamic ABC class (`A`/`B`/`C` by revenue concentration), `inferred_purchase_reason`.
+- `agg_customer_monthly` — **1 row per (`customer_id`, `reporting_month`).** Date-spined and zero-filled from each customer's first purchase month forward (rows exist even for no-purchase months) — built for cohort/MRR/MoM-retention DAX rather than plain SUM aggregation.
+- `agg_product_performance` — **1 row per (`performance_month`, `product_variant_id`).** Gross/net quantity and revenue, returns, taxes, COGS (net qty × standard cost), `contribution_margin` (net revenue − COGS).
+- `agg_sales_daily` — **1 row per (`date_id`, `channel`).** Gross/net revenue, returns, taxes, valid/canceled order volume, valid item volume (basket-size base).
+- `agg_sales_regional_category_daily` — **1 row per (`date_id`, `channel`, `customer_state`, `category_name`).** Items/revenue only — deliberately excludes order counts to avoid fan-out double-counting on multi-category orders.
+- `agg_sales_regional_orders_daily` — **1 row per (`date_id`, `channel`, `customer_state`).** Order counts only, split out from the category aggregate for the same fan-out reason — join/blend the two by their shared grain in DAX rather than expecting one table to carry both order counts and category breakdowns.
+
+All aggregates already net out cancellations, returns, and ICMS/IPI taxes per their column descriptions — check each `.yml` before re-deriving a "net" figure in DAX to avoid double-counting.
+
+`fct_daily_stock_levels` is an incremental model with **deferred surrogate-key backfill**: because `dim_products`/`dim_locations` rows can arrive after the corresponding fact rows, `product_sk`/`location_sk` are populated best-effort on insert and then repaired by a `post_hook` MERGE that fills any still-`NULL` surrogate keys once the dimension row shows up. When touching this model, keep both the `merge` incremental strategy and that post-hook in sync — a naive `insert_overwrite`-style rewrite would defeat the late-arrival repair.
+
+Shared macros: `dedupe_latest()`, `keep_required_rows()`, and `filter_valid_orders()` (`macros/data_quality_and_dedupe.sql`) handle `qualify row_number()` deduping, dropping rows with missing mandatory columns, and filtering out invalid/future-dated orders — used across staging/intermediate models rather than repeating the pattern inline. `convert_currency()` and `days_between()` (own files under `macros/`) handle USD/BRL conversion (via `stg_exchange_rates`) and date-diff arithmetic, both used in `int_purchases_enriched`/`int_supplier_delivery_delay`.
+
+`snapshots/snap_stock_levels.sql` (timestamp strategy on `stg_stock_levels`, keyed on `stock_level_id`) is the SCD2 history feeding `fct_daily_stock_levels`. `seeds/seed_category_fix.csv` is a manual lookup (by `product_type`) that `int_products_categorized` joins against to correct miscategorized/misspelled product types from the source system.
+
+Tests live in `dbt/tests/` as one directory per fact table (`fct_daily_stock_levels/`, `fct_purchases/`, `fct_returns/`) containing singular assertion SQL (e.g. no negative quantities, no future dates, 7-day reconciliation against source snapshots) in addition to schema tests declared in each model's `.yml`.
+
+## Demand forecasting workstream (`forecasting/`)
+
+Analysis code, not a committed dbt model or Databricks bundle. Scripts connect through `forecasting/_shared/db_connection.py`, which reads credentials from the `~/.dbt/profiles.yml` dev profile (no secrets stored in-repo): stable reference data (`dim_*`, `fct_*`, `stg_*`) is read from the prod catalog (`PROD_MARTS`), and disposable tables such as `fact_demand_daily` are written to each developer's own `<dev_schema>_forecasting_scratch` schema. Install with `uv sync --dev --group forecasting`. There are eleven numbered stages (`01`-`11`) plus an `experiments/` directory, each stage with a script/SQL that produces it and a markdown write-up; see [`forecasting/README.md`](forecasting/README.md) for the run order and [`forecasting/OVERVIEW.md`](forecasting/OVERVIEW.md) for the stage-by-stage narrative. Highlights most relevant to picking up new work:
+
+- `01_data_exploration/` — inventories the transformation layer for forecasting readiness. Key conclusion: **no existing mart is at product x store x day grain** — `agg_product_performance` is product x month with no location; the regional aggregates group by customer state, not selling location.
+- `02_schema_design/` — defines and prototypes `fact_demand_daily` (date x `product_variant_id` x `location_id`, dense/zero-filled), built in the scratch schema (e.g. `user_analytics_forecasting_scratch`) and reconciled exactly against `fct_sales`. Weekly/monthly grains roll up from this table via SQL, never reprocessing `fct_sales`.
+- `03_granularity_baselines/` — full-catalog backtest of Seasonal Naive / Moving Average / SES at daily, weekly and monthly grain. **Weekly is the recommended default grain**: daily is dominated by per-SKU sparsity (73% of observations are legitimately zero), and monthly loses the peak-season signal Moving Average/SES need to react to. Seasonal Naive wins accuracy per series at every grain but carries a structural growth-trend bias (the business grows ~15%/year, so "same period last year" under-forecasts).
+- `04`-`08` — demand-pattern classification (96.8% Intermittent / 3.2% Lumpy, no Smooth or Erratic series), Croston/SBA and ADIDA backtests, hierarchical (Bottom-Up/Top-Down/MinT) reconciliation, and decision-horizon/product-axis evaluation.
+- `09_baseline_close_out/` — the baseline every model is measured against: Moving Average and Seasonal Naive forecasts made once at a cutoff and **held static** over the 91-day horizon, scored across four rolling origins with a peak-season split and logged to `/Shared/00_baseline` in MLflow (`seasonal_naive_genuine_91d_v2` is the champion). A forecast that is recomputed as time passes would see real actuals from inside the window it is scored on, which is why every model is held static too.
+- `10_feature_engineering/` — Stage 2 (tasks 2.1-2.10): a pooled fixed-effects panel regression (product x location x ISO-week, entity effects + a linear trend control) testing calendar, holiday, weather, economic, marketing and internal/inventory features one cumulative layer at a time against a >2% MAPE-improvement threshold. **Only calendar survives into the production feature set** (via an accuracy ablation, not its own threshold — nothing individually cleared 2%); everything else is not kept, not testable with current data, or a structural control. [`10_feature_engineering/10_frozen_feature_set.md`](forecasting/10_feature_engineering/10_frozen_feature_set.md) is the fixed input for every Stage 3 (task 3.n) experiment — no changes without a new, explicit team decision. Logged to `/Shared/01_feature_iteration` in MLflow.
+- `experiments/` — Stage 3 (tasks 3.1-3.5) model experiments, one folder per person per model (`experiments/<name>_<model>/`: `eva_regression`, `eros_randomforest`, `gabriel_xgboost`, `eros_prophet`, `pinho_sarima`), each with its own `README.md` (design, how to run, results, limitations); results land in one shared MLflow experiment, `/Shared/02_model_comparison`. **Every model imports and scores through `experiments/_shared/evaluate.py`**, whatever grain it is fit at internally: predictions are summed into a total per (`product_variant_id`, `location_id`) over the four non-overlapping 91-day rolling-origin windows of `09_baseline_close_out` (2024-12-31 / 2025-04-01 / 2025-07-01 / 2025-09-30), training only on data up to each cutoff, and compared with the champion via `compare_to_baseline()` (which warns if a model's `actual_total` per window differs by more than 0.5% from the baseline's, a sign the window definition or source filter diverged). It reports two levels — SKU x location (`evaluate()`) and category x location (`to_category_level()`, which sums the *same* window totals rather than re-forecasting) — with RMSE/bias per series and portfolio WAPE per window, always per window rather than one averaged number; MAPE/sMAPE are excluded because `05_croston_sba` shows they are structurally uninformative on this catalog. Each experiment writes `<run>_window_totals.csv`, the input to the final comparison. See [`experiments/README.md`](forecasting/experiments/README.md) for the protocol's conventions and how to add an experiment.
+- `11_model_comparison/` — Stage 3 close-out (task 3.7): every committed experiment re-scored side by side from its `*_window_totals.csv` against the seasonal-naive champion (`build_comparison.py`; `log_comparison_to_mlflow.py` logs it as `final_comparison_3_7`). Headline: no model beats the champion in 3 or more of the 4 windows; XGBoost is the best trained model; SKU x location WAPE is 77-132% for every model, and category x location (11-39%) is the only usable level. The committed baseline's WAPE counts only series with sales in the window while models are scored on all 6,054 series; the report covers what that does to the ranking. See [`11_model_comparison/11_model_comparison_report.md`](forecasting/11_model_comparison/11_model_comparison_report.md).
+
+## RAG assistant (`databricks/rag`)
+
+The fourth bundle: a document-level RAG system answering questions about the project in Brazilian Portuguese, served as a Streamlit app on Databricks Apps. [`databricks/rag/README.md`](databricks/rag/README.md) is the authoritative document (14 sections: design principles, architecture, data model, offline pipeline, online path, serving, security, config reference, deployment, testing, troubleshooting, decision log) — read it before touching anything here. The essentials:
+
+- **The core invariant: the LLM never produces a fact.** Every number, id and date that can appear in an answer is rendered by a deterministic Spark template into `documents.corpo` *before* indexing; aggregates (quarterly totals, % variation) are computed in Spark. The prompt forbids re-computation, rounding and unit conversion. Don't add a code path where the model derives a figure.
+- **Offline pipeline** = the `rag_ingestion` job, a 6-task idempotent DAG: `setup → build_documents → build_chunks → ensure_index → sync_index → grant_app`. One `databricks bundle run rag_ingestion` prepares a deployment end to end; re-run it after the modelling or `docs/*.md` change. Idempotency comes from deterministic `doc_id`/`chunk_id`, SHA-256 `content_hash` and `MERGE`.
+- **Three document builders** (`src/rag/documents.py`): forecast cards from `fct_forecast ⨝ dim_products ⨝ dim_locations`, data-dictionary cards from `information_schema.columns`, and curated prose from `docs/*.md`. Notebook `01` unions whichever builders succeed (`unionByName(allowMissingColumns=True)`) — so a missing source degrades the corpus instead of failing the job.
+- **`fct_forecast` and `model_evaluation` were never materialized** (flagged as hypotheses H2/H11 in `config/rag_config.yaml`). Without them the pipeline still runs, just with no forecast cards. Don't assume they exist.
+- **Online path** is stateless: hybrid search (ANN + BM25, RRF) → relative-score cut-off → per-document cap → top-5 → prompt → `databricks-llama-4-maverick` at `temperature=0`. Retrieved text is wrapped in delimited `[DOCUMENTO n]` blocks and the prompt states that instructions inside the context must be ignored.
+- **`config/rag_config.yaml` is the single source** for names, models and retrieval/chunking parameters; the bundle overrides `catalog`/`schema_gold`/`schema_rag` at runtime via job parameters that `notebooks/_bootstrap.py` exports as `RAG_*` env vars. Add a tunable there, not inline.
+- **No secrets.** Notebooks/jobs use the ambient workspace identity; the app authenticates with its own service principal from `DATABRICKS_CLIENT_ID`/`DATABRICKS_CLIENT_SECRET` (`Retriever._build_client`, which also prepends the missing `https://` to `DATABRICKS_HOST` in Apps).
+- `src/rag/chunking.py` and `src/rag/prompts.py` are pure Python and covered by `databricks/rag/tests/` — the only tests in the repo that run without a workspace. Keep them dependency-free so that stays true.
+
+## Code style
+
+- Add brief comment descriptions for each function or block of logic to explain **what** it does. Comments should be concise (one line, typically) and placed directly above or inline with the code they describe. Example:
+  ```sql
+  -- Normalize postal codes to Brazilian standard XXXXX-XXX format, strip non-numeric chars
+  case
+      when postal_code is not null
+      then concat(
+          substr(trim(regexp_replace(postal_code, '[^0-9]', '')), 1, 5),
+          '-',
+          substr(trim(regexp_replace(postal_code, '[^0-9]', '')), 6, 3)
+      )
+      else null
+  end as postal_code,
+  ```
+
+## Testing and validation
+
+- After making any changes to a dbt model, run `dbt build -s <model_name>` to verify the changes don't break anything. This builds only the changed model and its upstream/downstream dependencies, catching syntax errors, broken references, and test failures without the overhead of a full rebuild.
+  ```bash
+  dbt build -s dim_customer_addresses
+  ```

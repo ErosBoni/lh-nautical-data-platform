@@ -1,0 +1,27 @@
+resources:
+  jobs:
+    ingestion_orchestration:
+      name: "LH Nautical Orchestration"
+
+      # The two job_ids below are workspace-specific: the ingestion and
+      # transformation bundles must be deployed first, then read each job's id
+      # from `databricks bundle summary` (run inside that bundle's directory) or
+      # from the job URL in the workspace, and paste it here.
+      tasks:
+        - task_key: ingestion
+          max_retries: 2
+          run_job_task:
+            job_id: "<ingestion-job-id>"
+        - task_key: transformation
+          max_retries: 2
+          depends_on:
+            - task_key: ingestion
+          run_job_task:
+            job_id: "<transformation-job-id>"
+
+      schedule:
+        quartz_cron_expression: "0 0 1 * * ?"
+        timezone_id: "America/Sao_Paulo"
+        pause_status: UNPAUSED
+
+      max_concurrent_runs: 1

@@ -1,0 +1,23 @@
+# Per-developer bundle overrides. Copy to `databricks.local.yml` at the repository
+# root (it is gitignored) and edit the two values below.
+#
+#     cp databricks.local.yml.example databricks.local.yml
+#
+# This file is NOT optional: the `ingestion`, `orchestration` and `rag` bundles all
+# declare it as an `include:`, so `databricks bundle validate` fails with a
+# missing-file error until it exists.
+#
+# The `transformation` bundle does not include it — that one takes its host from the
+# Databricks CLI profile and derives its schema from
+# ${workspace.current_user.short_name}.
+
+targets:
+  dev:
+    workspace:
+      # Your own Databricks workspace URL, e.g. https://dbc-xxxxxxxx-xxxx.cloud.databricks.com/
+      host: https://<your-workspace>.cloud.databricks.com/
+    variables:
+      # Your personal dev schema prefix. Convention in this project is
+      # <short_name>_analytics, matching what the dbt profile and the
+      # transformation bundle use, e.g. "eros_analytics".
+      dev_schema: <your_short_name>_analytics
